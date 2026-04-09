@@ -1,3 +1,0 @@
-torch>=2.1
-biopython>=1.83
-fair-esm>=2.0.0
