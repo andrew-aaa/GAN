@@ -1,99 +1,100 @@
-"""Метрики качества генерации: валидность, diversity, KL по аминокислотам, длина, EOS-структура."""
-
 from __future__ import annotations
 
-from typing import Iterable
+from collections import Counter
+import math
 
 import torch
 
-from config import PAD_IDX, EOS_IDX, AA_START_IDX, VOCAB_SIZE
-from utils import infer_lengths_from_tokens
+from config import PAD_IDX, EOS_IDX, AA_START_IDX
+from utils import decode_sequence
 
 
-def _valid_aa_tokens(token_ids: torch.Tensor):
-    return token_ids[(token_ids >= AA_START_IDX) & (token_ids < VOCAB_SIZE)]
-
-
-def amino_acid_frequency(token_ids: torch.Tensor) -> torch.Tensor:
-    aa_tokens = _valid_aa_tokens(token_ids)
-    counts = torch.ones(VOCAB_SIZE - AA_START_IDX, dtype=torch.float32, device=token_ids.device)
-    if aa_tokens.numel() > 0:
-        aa_tokens = aa_tokens - AA_START_IDX
-        bincount = torch.bincount(aa_tokens, minlength=VOCAB_SIZE - AA_START_IDX).float()
-        counts = counts + bincount
-    return counts / counts.sum()
-
-
-def aa_frequency_kl(fake_token_ids: torch.Tensor, real_token_ids: torch.Tensor) -> float:
-    p = amino_acid_frequency(fake_token_ids)
-    q = amino_acid_frequency(real_token_ids)
-    return float((p * (p.log() - q.log())).sum().item())
-
-
-def _sequence_without_special(token_row: Iterable[int]):
-    seq = []
-    for token in token_row:
-        t = int(token)
-        if t in (PAD_IDX, EOS_IDX):
+def _trim_ids(row: torch.Tensor):
+    out = []
+    for x in row.tolist():
+        if x in (PAD_IDX,):
+            continue
+        if x == EOS_IDX:
             break
-        if t >= AA_START_IDX:
-            seq.append(t)
-    return seq
+        if x >= AA_START_IDX:
+            out.append(int(x))
+    return out
 
 
-def ngram_diversity(token_ids: torch.Tensor, n: int = 2) -> float:
-    grams = []
-    for row in token_ids.tolist():
-        seq = _sequence_without_special(row)
-        if len(seq) < n:
-            continue
-        grams.extend(tuple(seq[i:i + n]) for i in range(len(seq) - n + 1))
-    if not grams:
-        return 0.0
-    return len(set(grams)) / len(grams)
+def nonempty_ratio(fake_ids: torch.Tensor) -> float:
+    vals = [1.0 if len(_trim_ids(row)) > 0 else 0.0 for row in fake_ids]
+    return float(sum(vals) / max(1, len(vals)))
 
 
-def eos_exact_rate(token_ids: torch.Tensor, target_lengths: torch.Tensor) -> float:
-    ok = 0
-    total = token_ids.size(0)
-    for row, target_len in zip(token_ids, target_lengths):
-        target_len = int(target_len)
-        if target_len < row.numel() and int(row[target_len]) == EOS_IDX:
-            ok += 1
-    return ok / max(1, total)
-
-
-def valid_eos_pad_rate(token_ids: torch.Tensor) -> float:
-    ok = 0
-    total = token_ids.size(0)
-    for row in token_ids.tolist():
-        eos_positions = [i for i, token in enumerate(row) if int(token) == EOS_IDX]
-        if len(eos_positions) != 1:
-            continue
-        eos_pos = eos_positions[0]
-        tail = row[eos_pos + 1:]
-        if all(int(token) == PAD_IDX for token in tail):
-            ok += 1
-    return ok / max(1, total)
-
-
-def length_mae(token_ids: torch.Tensor, target_lengths: torch.Tensor) -> float:
-    pred_lengths = infer_lengths_from_tokens(token_ids)
-    return float((pred_lengths.float() - target_lengths.float()).abs().mean().item())
-
-
-def nonempty_ratio(token_ids: torch.Tensor) -> float:
-    lengths = infer_lengths_from_tokens(token_ids)
-    return float((lengths > 0).float().mean().item())
-
-
-def repeat_ratio(token_ids: torch.Tensor) -> float:
-    repeats = []
-    for row in token_ids.tolist():
-        seq = _sequence_without_special(row)
+def repeat_ratio(fake_ids: torch.Tensor) -> float:
+    values = []
+    for row in fake_ids:
+        seq = _trim_ids(row)
         if len(seq) < 2:
-            repeats.append(0.0)
+            values.append(0.0)
             continue
         rep = sum(1 for i in range(1, len(seq)) if seq[i] == seq[i - 1]) / (len(seq) - 1)
-        repeats.append(rep)
-    return float(sum(repeats) / max(1, len(repeats)))
+        values.append(rep)
+    return float(sum(values) / max(1, len(values)))
+
+
+def ngram_diversity(fake_ids: torch.Tensor, n: int = 2) -> float:
+    scores = []
+    for row in fake_ids:
+        seq = _trim_ids(row)
+        if len(seq) < n:
+            scores.append(0.0)
+            continue
+        grams = [tuple(seq[i:i+n]) for i in range(len(seq) - n + 1)]
+        scores.append(len(set(grams)) / max(1, len(grams)))
+    return float(sum(scores) / max(1, len(scores)))
+
+
+def aa_frequency_kl(fake_ids: torch.Tensor, real_ids: torch.Tensor) -> float:
+    def freq(t: torch.Tensor):
+        c = Counter()
+        total = 0
+        for row in t:
+            seq = _trim_ids(row)
+            c.update(seq)
+            total += len(seq)
+        probs = []
+        for idx in range(AA_START_IDX, int(fake_ids.max().item()) + 1 if fake_ids.numel() else AA_START_IDX):
+            probs.append((c[idx] + 1e-6) / (total + 1e-6 * max(1, len(c))))
+        if not probs:
+            probs = [1.0]
+        s = sum(probs)
+        return [p / s for p in probs]
+    p = freq(fake_ids)
+    q = freq(real_ids)
+    m = min(len(p), len(q))
+    p = p[:m]
+    q = q[:m]
+    return float(sum(pi * math.log((pi + 1e-8) / (qi + 1e-8)) for pi, qi in zip(p, q)))
+
+
+def predicted_lengths(fake_ids: torch.Tensor) -> torch.Tensor:
+    lengths = []
+    for row in fake_ids:
+        length = 0
+        for x in row.tolist():
+            if x == EOS_IDX:
+                break
+            if x >= AA_START_IDX:
+                length += 1
+        lengths.append(length)
+    return torch.tensor(lengths, dtype=torch.float32)
+
+
+def length_mae(fake_ids: torch.Tensor, target_lengths: torch.Tensor) -> float:
+    pred = predicted_lengths(fake_ids)
+    return float(torch.abs(pred - target_lengths.float().cpu()).mean().item())
+
+
+def eos_exact_rate(fake_ids: torch.Tensor, target_lengths: torch.Tensor) -> float:
+    hits = []
+    for row, tlen in zip(fake_ids, target_lengths.tolist()):
+        row = row.tolist()
+        eos_pos = row.index(EOS_IDX) if EOS_IDX in row else None
+        hits.append(1.0 if eos_pos == int(tlen) else 0.0)
+    return float(sum(hits) / max(1, len(hits)))

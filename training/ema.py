@@ -1,5 +1,3 @@
-"""EMA-обёртка для генератора."""
-
 from __future__ import annotations
 
 import copy
@@ -16,15 +14,11 @@ class EMA:
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
         msd = model.state_dict()
-        ssd = self.shadow.state_dict()
-        for key, value in ssd.items():
-            if key not in msd:
-                continue
-            src = msd[key].detach()
-            if not torch.is_floating_point(src):
-                value.copy_(src)
+        for k, v in self.shadow.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(msd[k], alpha=1.0 - self.decay)
             else:
-                value.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
+                v.copy_(msd[k])
 
     def state_dict(self):
         return self.shadow.state_dict()

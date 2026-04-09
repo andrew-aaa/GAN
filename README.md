@@ -1,54 +1,52 @@
-# Improved antidote GAN
+# Antidote GAN — Colab-friendly version
 
-В проект добавлены приоритетные улучшения из аудита:
-- **projection-discriminator** вместо простой конкатенации признаков;
-- **mismatched-pairs** в обучении критика, чтобы дискриминатор реально учитывал условие токсина;
-- **mask по длине**, а не через `argmax(one-hot)`, что корректнее для WGAN-GP;
-- **dropout убран из дискриминатора** для более стабильного сигнала критика;
-- **validation split** и усреднение метрик по эпохе;
-- логирование в **`logs/metrics.csv`**;
-- **temperature annealing** в обучении;
-- корректный **temperature-sampling на инференсе** через масштабирование логитов;
-- строгий разбор ID в `prepare_pairs.py` через регулярные выражения.
+Это версия проекта, переделанная так, чтобы обучение не "замирало" на первой эпохе в Google Colab.
 
-## Порядок запуска
+## Что изменено
 
-1. Положить исходные FASTA в `data/`:
-   - `type_II_T_exp.fas`
-   - `type_II_AT_exp.fas`
-2. Подготовить пары:
-   ```bash
-   python prepare_pairs.py
-   ```
-3. Предвычислить эмбеддинги токсинов:
-   ```bash
-   python precompute_toxin_embeddings.py
-   ```
-4. Обучить модель:
-   ```bash
-   python train.py
-   ```
-5. Сгенерировать кандидата:
-   ```bash
-   python generate_antidote.py
-   ```
+- Убрана самая дорогая часть: autoregressive `sample()` больше **не используется внутри train loop**.
+- Во время обучения fake-последовательности строятся через **один teacher-forcing проход** генератора.
+- Добавлены:
+  - `tqdm`-прогресс по батчам;
+  - `train/val split`;
+  - усреднение метрик по эпохе;
+  - логирование в `logs/metrics.csv`;
+  - `mismatched pairs` для усиления conditional GAN;
+  - `projection discriminator`;
+  - корректная маска по длине, а не через `argmax(one-hot)`;
+  - `temperature annealing` в обучении.
 
-## Что теперь логируется
+## Почему раньше казалось, что код завис
 
-В `logs/metrics.csv` сохраняются:
-- train/val/ema_val proxy;
-- train/val валидность EOS/PAD;
-- length MAE;
-- n-gram diversity (`ng2`, `ng3`);
-- KL по частотам аминокислот;
-- repeat ratio;
-- текущий вес adversarial-компонента и температура семплирования.
+В старой схеме `generator.sample()` вызывался прямо в обучении. Он генерировал последовательность **пошагово**, и на каждом шаге заново прогонял трансформер по всей длине. На CPU или даже в слабом Colab-GPU это делало первую эпоху очень долгой.
 
-## Структура
-- `data/dataset.py` — датасет с предвычисленными ESM-эмбеддингами;
-- `models/generator.py` — autoregressive generator с teacher forcing;
-- `models/discriminator.py` — projection-discriminator с conditioning по токсину;
-- `training/losses.py` — WGAN-GP и supervised loss;
-- `training/metrics.py` — валидность / diversity / KL / length метрики;
-- `training/ema.py` — EMA для генератора;
-- `inference/generate_antidote.py` — инференс и выбор лучшего кандидата.
+## Как запускать в Colab
+
+```python
+!pip install fair-esm biopython tqdm
+```
+
+Скопируй проект в `/content/GAN`, затем:
+
+```python
+%cd /content/GAN
+!python prepare_pairs.py
+!python precompute_toxin_embeddings.py
+!python train.py
+```
+
+## Проверка GPU
+
+```python
+import torch
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')
+```
+
+Если `False`, значит Colab сейчас реально на CPU.
+
+## Инференс
+
+```python
+!python inference/generate_antidote.py
+```

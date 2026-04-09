@@ -1,74 +1,23 @@
 from __future__ import annotations
 
-import csv
 import math
-import random
-from collections import defaultdict
-from pathlib import Path
+from copy import deepcopy
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-from config import (
-    DEVICE,
-    BATCH_SIZE,
-    EPOCHS,
-    GENERATOR_PRETRAIN_EPOCHS,
-    N_CRITIC,
-    VAL_SPLIT,
-    SEED,
-    LR_G,
-    LR_D,
-    BETAS,
-    WEIGHT_DECAY,
-    LATENT_DIM,
-    VOCAB_SIZE,
-    MODEL_SAVE_PATH,
-    BEST_PROXY_MODEL_SAVE_PATH,
-    EMA_MODEL_SAVE_PATH,
-    BEST_EMA_PROXY_MODEL_SAVE_PATH,
-    METRICS_CSV_PATH,
-    TOXIN_FASTA_PATH,
-    ANTITOXIN_FASTA_PATH,
-    TOXIN_EMBEDDINGS_PATH,
-    LAMBDA_GP,
-    MISMATCH_WEIGHT,
-    EMA_DECAY,
-    GRAD_CLIP_NORM,
-    ADV_WEIGHT_MAX,
-    TOKEN_CE_WEIGHT,
-    LENGTH_LOSS_WEIGHT,
-    TAU_START,
-    TAU_END,
-)
-from utils import to_one_hot
+from config import *
+from utils import set_seed, to_one_hot, write_metrics_row
 from data.dataset import ToxinAntitoxinDataset
 from models.generator import Generator
 from models.discriminator import Discriminator
 from training.ema import EMA
 from training.losses import gradient_penalty, token_ce_loss
-from training.metrics import (
-    aa_frequency_kl,
-    ngram_diversity,
-    eos_exact_rate,
-    valid_eos_pad_rate,
-    length_mae,
-    nonempty_ratio,
-    repeat_ratio,
-)
-
-
-def set_seed(seed: int):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-@torch.no_grad()
-def ema_forward(ema: EMA, *args, **kwargs):
-    return ema.shadow(*args, **kwargs)
+from training.metrics import aa_frequency_kl, ngram_diversity, eos_exact_rate, length_mae, nonempty_ratio, repeat_ratio
 
 
 def get_adv_weight(epoch_idx: int) -> float:
@@ -79,136 +28,73 @@ def get_adv_weight(epoch_idx: int) -> float:
     return ADV_WEIGHT_MAX * progress
 
 
-def get_sampling_temperature(epoch_idx: int) -> float:
-    if EPOCHS <= 1:
-        return TAU_END
-    progress = epoch_idx / (EPOCHS - 1)
+def get_tau(epoch_idx: int) -> float:
+    progress = min(1.0, epoch_idx / max(1, EPOCHS - 1))
     return TAU_START + (TAU_END - TAU_START) * progress
 
 
-def metrics_template() -> dict[str, float]:
+def collect_metrics(fake_onehot: torch.Tensor, real_target: torch.Tensor, target_lengths: torch.Tensor) -> Dict[str, float]:
+    fake_ids = fake_onehot.argmax(dim=-1).detach().cpu()
+    real_ids = real_target.detach().cpu()
+    target_lengths = target_lengths.detach().cpu()
     return {
-        "nonempty": 0.0,
-        "valid": 0.0,
-        "repeat_ratio": 0.0,
-        "ngram2": 0.0,
-        "ngram3": 0.0,
-        "aa_kl": 0.0,
-        "len_mae": 0.0,
-        "eos_exact": 0.0,
+        'nonempty': nonempty_ratio(fake_ids),
+        'repeat_ratio': repeat_ratio(fake_ids),
+        'ngram2': ngram_diversity(fake_ids, n=2),
+        'ngram3': ngram_diversity(fake_ids, n=3),
+        'aa_kl': aa_frequency_kl(fake_ids, real_ids),
+        'len_mae': length_mae(fake_ids, target_lengths),
+        'eos_exact': eos_exact_rate(fake_ids, target_lengths),
     }
 
 
-def evaluate_batch_metrics(fake_onehot: torch.Tensor, real_target: torch.Tensor, target_lengths: torch.Tensor):
-    fake_ids = fake_onehot.argmax(dim=-1)
-    real_ids = real_target
-    return {
-        "nonempty": nonempty_ratio(fake_ids),
-        "valid": valid_eos_pad_rate(fake_ids),
-        "repeat_ratio": repeat_ratio(fake_ids),
-        "ngram2": ngram_diversity(fake_ids, n=2),
-        "ngram3": ngram_diversity(fake_ids, n=3),
-        "aa_kl": aa_frequency_kl(fake_ids, real_ids),
-        "len_mae": length_mae(fake_ids, target_lengths),
-        "eos_exact": eos_exact_rate(fake_ids, target_lengths),
-    }
-
-
-def aggregate_metrics(acc: dict[str, float], metrics: dict[str, float]):
-    for key, value in metrics.items():
-        acc[key] += float(value)
-
-
-def average_metrics(acc: dict[str, float], count: int) -> dict[str, float]:
-    if count == 0:
-        return {k: 0.0 for k in acc}
-    return {k: v / count for k, v in acc.items()}
+def mean_dict(items: list[dict[str, float]]) -> dict[str, float]:
+    if not items:
+        return {}
+    keys = items[0].keys()
+    return {k: float(sum(x[k] for x in items) / len(items)) for k in keys}
 
 
 @torch.no_grad()
-def evaluate_model(generator_like, loader: DataLoader, sampling_temperature: float, adv_weight: float, use_ema: bool = False):
-    metrics_acc = metrics_template()
-    proxy_sum = 0.0
-    batch_count = 0
-
+def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, float]:
+    generator.eval()
+    tau = get_tau(epoch)
+    metrics = []
+    ce_vals = []
+    len_vals = []
     for toxin_emb, decoder_input, target, aa_lengths in loader:
         toxin_emb = toxin_emb.to(DEVICE).float()
         decoder_input = decoder_input.to(DEVICE).long()
         target = target.to(DEVICE).long()
         aa_lengths = aa_lengths.to(DEVICE).long()
-
         z = torch.randn(toxin_emb.size(0), LATENT_DIM, device=DEVICE)
-
-        if use_ema:
-            logits, _ = generator_like.forward_teacher(decoder_input, toxin_emb, z=z, target_lengths=aa_lengths)
-            fake_onehot, _ = generator_like.sample(
-                toxin_emb,
-                z=z,
-                target_lengths=aa_lengths,
-                sampling_temperature=sampling_temperature,
-                gumbel_tau=1.0,
-                hard=True,
-            )
-            length_logits = generator_like.get_length_logits(toxin_emb)
-        else:
-            logits, _ = generator_like.forward_teacher(decoder_input, toxin_emb, z=z, target_lengths=aa_lengths)
-            fake_onehot, _ = generator_like.sample(
-                toxin_emb,
-                z=z,
-                target_lengths=aa_lengths,
-                sampling_temperature=sampling_temperature,
-                gumbel_tau=1.0,
-                hard=True,
-            )
-            length_logits = generator_like.get_length_logits(toxin_emb)
-
-        token_loss = token_ce_loss(logits, target)
-        length_loss = F.cross_entropy(length_logits, aa_lengths)
-        batch_metrics = evaluate_batch_metrics(fake_onehot, target, aa_lengths)
-
-        proxy = float(token_loss.item() + 0.5 * length_loss.item() + 0.2 * batch_metrics["aa_kl"])
-        proxy_sum += proxy
-        aggregate_metrics(metrics_acc, batch_metrics)
-        batch_count += 1
-
-    return proxy_sum / max(1, batch_count), average_metrics(metrics_acc, batch_count)
-
-
-def write_metrics_csv(rows: list[dict[str, float | int | str]]):
-    path = Path(METRICS_CSV_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+        logits, _ = generator.forward_teacher(decoder_input, toxin_emb, z=z, target_lengths=aa_lengths)
+        fake_onehot = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+        ce_vals.append(float(token_ce_loss(logits, target).item()))
+        len_vals.append(float(F.cross_entropy(generator.get_length_logits(toxin_emb), aa_lengths).item()))
+        metrics.append(collect_metrics(fake_onehot, target, aa_lengths))
+    out = mean_dict(metrics)
+    out['token_ce'] = float(sum(ce_vals) / max(1, len(ce_vals)))
+    out['length_loss'] = float(sum(len_vals) / max(1, len(len_vals)))
+    out['proxy'] = out['token_ce'] + 0.5 * out['length_loss'] + 0.2 * out['aa_kl']
+    generator.train()
+    return out
 
 
 def main():
     set_seed(SEED)
+    print(f'Using device: {DEVICE}')
+    print(f'Loading toxin embeddings from: {TOXIN_EMBEDDINGS_PATH}')
 
-    print(f"Using device: {DEVICE}")
-    print(f"Loading toxin embeddings from: {TOXIN_EMBEDDINGS_PATH}")
+    dataset = ToxinAntitoxinDataset(TOXIN_FASTA_PATH, ANTITOXIN_FASTA_PATH, TOXIN_EMBEDDINGS_PATH)
+    n_val = max(1, int(len(dataset) * VAL_SPLIT))
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(SEED))
+    print(f'[split] train={len(train_ds)} val={len(val_ds)}')
 
-    dataset = ToxinAntitoxinDataset(
-        TOXIN_FASTA_PATH,
-        ANTITOXIN_FASTA_PATH,
-        TOXIN_EMBEDDINGS_PATH,
-    )
-
-    val_size = max(1, int(len(dataset) * VAL_SPLIT))
-    train_size = len(dataset) - val_size
-    if train_size <= 0:
-        raise ValueError("После разбиения не осталось обучающих примеров. Уменьши VAL_SPLIT.")
-
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(SEED),
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+    loader_kwargs = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_kwargs)
 
     generator = Generator().to(DEVICE)
     discriminator = Discriminator().to(DEVICE)
@@ -217,194 +103,125 @@ def main():
     optimizer_G = optim.AdamW(generator.parameters(), lr=LR_G, betas=BETAS, weight_decay=WEIGHT_DECAY)
     optimizer_D = optim.AdamW(discriminator.parameters(), lr=LR_D, betas=BETAS, weight_decay=WEIGHT_DECAY)
 
-    best_val_proxy = float("inf")
-    csv_rows: list[dict[str, float | int | str]] = []
+    best_val_proxy = math.inf
+    fieldnames = [
+        'epoch', 'phase', 'tau', 'adv_w', 'train_d_loss', 'train_g_loss', 'train_proxy',
+        'val_proxy', 'val_token_ce', 'val_length_loss', 'val_nonempty', 'val_len_mae',
+        'val_eos_exact', 'val_ngram2', 'val_ngram3', 'val_aa_kl', 'val_repeat_ratio'
+    ]
 
     for epoch in range(EPOCHS):
         generator.train()
         discriminator.train()
-
         adv_weight = get_adv_weight(epoch)
-        sampling_temperature = get_sampling_temperature(epoch)
+        tau = get_tau(epoch)
 
-        train_loss_d_sum = 0.0
-        train_loss_g_sum = 0.0
-        train_metrics_acc = metrics_template()
-        d_updates = 0
-        g_updates = 0
+        batch_metrics = []
+        d_losses, g_losses, proxies = [], [], []
 
-        for batch_idx, (toxin_emb, decoder_input, target, aa_lengths) in enumerate(train_loader):
+        progress = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS}', leave=False)
+        for batch_idx, (toxin_emb, decoder_input, target, aa_lengths) in enumerate(progress):
             toxin_emb = toxin_emb.to(DEVICE).float()
             decoder_input = decoder_input.to(DEVICE).long()
             target = target.to(DEVICE).long()
             aa_lengths = aa_lengths.to(DEVICE).long()
             real_onehot = to_one_hot(target, VOCAB_SIZE).to(DEVICE)
             batch_size = toxin_emb.size(0)
+            z = torch.randn(batch_size, LATENT_DIM, device=DEVICE)
 
-            # ===== Critic =====
+            # Fast fake pass: one transformer pass via teacher forcing
+            logits, _ = generator.forward_teacher(decoder_input, toxin_emb, z=z, target_lengths=aa_lengths)
+            fake_onehot = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+
             if adv_weight > 0.0:
-                z = torch.randn(batch_size, LATENT_DIM, device=DEVICE)
-                fake_onehot, _ = generator.sample(
-                    toxin_emb,
-                    z=z,
-                    target_lengths=aa_lengths,
-                    sampling_temperature=sampling_temperature,
-                    gumbel_tau=1.0,
-                    hard=True,
-                )
-
                 real_score = discriminator(toxin_emb, real_onehot, aa_lengths)
                 fake_score = discriminator(toxin_emb, fake_onehot.detach(), aa_lengths)
-
-                if batch_size > 1:
-                    perm = torch.randperm(batch_size, device=DEVICE)
-                    mismatch_toxin_emb = toxin_emb[perm]
-                    mismatch_score = discriminator(mismatch_toxin_emb, real_onehot, aa_lengths)
-                    fake_mix = 0.5 * fake_score.mean() + MISMATCH_WEIGHT * mismatch_score.mean()
-                else:
-                    fake_mix = fake_score.mean()
-
-                gp = gradient_penalty(
-                    discriminator,
-                    toxin_emb,
-                    real_onehot,
-                    fake_onehot.detach(),
-                    aa_lengths,
-                    DEVICE,
-                )
+                perm = torch.randperm(batch_size, device=DEVICE)
+                mismatch_score = discriminator(toxin_emb[perm], real_onehot, aa_lengths)
+                gp = gradient_penalty(discriminator, toxin_emb, real_onehot, fake_onehot.detach(), aa_lengths, DEVICE)
+                fake_mix = (1.0 - MISMATCH_WEIGHT) * fake_score.mean() + MISMATCH_WEIGHT * mismatch_score.mean()
                 loss_D = -(real_score.mean() - fake_mix) + LAMBDA_GP * gp
-
                 optimizer_D.zero_grad(set_to_none=True)
                 loss_D.backward()
                 torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP_NORM)
                 optimizer_D.step()
+                d_losses.append(float(loss_D.item()))
+            else:
+                loss_D = torch.tensor(0.0, device=DEVICE)
 
-                train_loss_d_sum += float(loss_D.item())
-                d_updates += 1
-
-            # ===== Generator =====
             should_update_g = (batch_idx % N_CRITIC == 0) or adv_weight == 0.0
             if should_update_g:
-                z = torch.randn(batch_size, LATENT_DIM, device=DEVICE)
-                logits, _ = generator.forward_teacher(
-                    decoder_input,
-                    toxin_emb,
-                    z=z,
-                    target_lengths=aa_lengths,
-                )
                 token_loss = token_ce_loss(logits, target)
-                length_logits = generator.get_length_logits(toxin_emb)
-                length_loss = F.cross_entropy(length_logits, aa_lengths)
-
+                length_loss = F.cross_entropy(generator.get_length_logits(toxin_emb), aa_lengths)
                 adv_loss = torch.tensor(0.0, device=DEVICE)
-                fake_onehot, _ = generator.sample(
-                    toxin_emb,
-                    z=z,
-                    target_lengths=aa_lengths,
-                    sampling_temperature=sampling_temperature,
-                    gumbel_tau=1.0,
-                    hard=True,
-                )
                 if adv_weight > 0.0:
-                    fake_score = discriminator(toxin_emb, fake_onehot, aa_lengths)
-                    adv_loss = -fake_score.mean()
-
-                loss_G = (
-                    TOKEN_CE_WEIGHT * token_loss
-                    + LENGTH_LOSS_WEIGHT * length_loss
-                    + adv_weight * adv_loss
-                )
-
+                    adv_loss = -discriminator(toxin_emb, fake_onehot, aa_lengths).mean()
+                loss_G = TOKEN_CE_WEIGHT * token_loss + LENGTH_LOSS_WEIGHT * length_loss + adv_weight * adv_loss
                 optimizer_G.zero_grad(set_to_none=True)
                 loss_G.backward()
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), GRAD_CLIP_NORM)
                 optimizer_G.step()
                 ema.update(generator)
 
-                batch_metrics = evaluate_batch_metrics(fake_onehot.detach(), target, aa_lengths)
-                aggregate_metrics(train_metrics_acc, batch_metrics)
-                train_loss_g_sum += float(loss_G.item())
-                g_updates += 1
+                cur_metrics = collect_metrics(fake_onehot, target, aa_lengths)
+                proxy = float(token_loss.item() + 0.5 * length_loss.item() + 0.2 * cur_metrics['aa_kl'])
+                batch_metrics.append(cur_metrics)
+                g_losses.append(float(loss_G.item()))
+                proxies.append(proxy)
+                progress.set_postfix(g=f'{loss_G.item():.3f}', d=f'{loss_D.item():.3f}', proxy=f'{proxy:.3f}', tau=f'{tau:.2f}')
 
-        generator.eval()
-        ema.shadow.eval()
+        train_metrics = mean_dict(batch_metrics) if batch_metrics else {
+            'nonempty': 0.0, 'repeat_ratio': 0.0, 'ngram2': 0.0, 'ngram3': 0.0, 'aa_kl': 0.0, 'len_mae': 0.0, 'eos_exact': 0.0
+        }
+        train_d_loss = float(sum(d_losses) / max(1, len(d_losses)))
+        train_g_loss = float(sum(g_losses) / max(1, len(g_losses)))
+        train_proxy = float(sum(proxies) / max(1, len(proxies))) if proxies else math.inf
 
-        train_metrics = average_metrics(train_metrics_acc, g_updates)
-        train_loss_d = train_loss_d_sum / max(1, d_updates)
-        train_loss_g = train_loss_g_sum / max(1, g_updates)
+        val_metrics = evaluate(generator, val_loader, epoch)
+        ema_val_metrics = evaluate(ema.shadow, val_loader, epoch)
 
-        val_proxy, val_metrics = evaluate_model(generator, val_loader, sampling_temperature, adv_weight, use_ema=False)
-        ema_val_proxy, ema_val_metrics = evaluate_model(ema.shadow, val_loader, sampling_temperature, adv_weight, use_ema=True)
-
-        torch.save(generator.state_dict(), MODEL_SAVE_PATH)
-        torch.save(ema.state_dict(), EMA_MODEL_SAVE_PATH)
-
-        if ema_val_proxy < best_val_proxy:
-            best_val_proxy = ema_val_proxy
-            torch.save(generator.state_dict(), BEST_PROXY_MODEL_SAVE_PATH)
-            torch.save(ema.state_dict(), BEST_EMA_PROXY_MODEL_SAVE_PATH)
+        torch.save(generator.state_dict(), GENERATOR_LAST_PATH)
+        torch.save(ema.state_dict(), EMA_LAST_PATH)
+        if val_metrics['proxy'] < best_val_proxy:
+            best_val_proxy = val_metrics['proxy']
+            torch.save(generator.state_dict(), GENERATOR_BEST_PATH)
+            torch.save(ema.state_dict(), EMA_BEST_PATH)
 
         row = {
-            "epoch": epoch + 1,
-            "phase": "pretrain" if adv_weight == 0.0 else "hybrid",
-            "adv_w": round(adv_weight, 6),
-            "sample_temp": round(sampling_temperature, 6),
-            "train_d_loss": round(train_loss_d, 6),
-            "train_g_loss": round(train_loss_g, 6),
-            "train_nonempty": round(train_metrics["nonempty"], 6),
-            "train_valid": round(train_metrics["valid"], 6),
-            "train_len_mae": round(train_metrics["len_mae"], 6),
-            "train_eos_exact": round(train_metrics["eos_exact"], 6),
-            "train_ng2": round(train_metrics["ngram2"], 6),
-            "train_ng3": round(train_metrics["ngram3"], 6),
-            "train_aa_kl": round(train_metrics["aa_kl"], 6),
-            "train_repeat": round(train_metrics["repeat_ratio"], 6),
-            "val_proxy": round(val_proxy, 6),
-            "val_nonempty": round(val_metrics["nonempty"], 6),
-            "val_valid": round(val_metrics["valid"], 6),
-            "val_len_mae": round(val_metrics["len_mae"], 6),
-            "val_eos_exact": round(val_metrics["eos_exact"], 6),
-            "val_ng2": round(val_metrics["ngram2"], 6),
-            "val_ng3": round(val_metrics["ngram3"], 6),
-            "val_aa_kl": round(val_metrics["aa_kl"], 6),
-            "val_repeat": round(val_metrics["repeat_ratio"], 6),
-            "ema_val_proxy": round(ema_val_proxy, 6),
-            "ema_val_nonempty": round(ema_val_metrics["nonempty"], 6),
-            "ema_val_valid": round(ema_val_metrics["valid"], 6),
-            "ema_val_len_mae": round(ema_val_metrics["len_mae"], 6),
-            "ema_val_eos_exact": round(ema_val_metrics["eos_exact"], 6),
-            "ema_val_ng2": round(ema_val_metrics["ngram2"], 6),
-            "ema_val_ng3": round(ema_val_metrics["ngram3"], 6),
-            "ema_val_aa_kl": round(ema_val_metrics["aa_kl"], 6),
-            "ema_val_repeat": round(ema_val_metrics["repeat_ratio"], 6),
-            "best_ema_val_proxy": round(best_val_proxy, 6),
+            'epoch': epoch + 1,
+            'phase': 'pretrain' if adv_weight == 0.0 else 'hybrid',
+            'tau': round(tau, 4),
+            'adv_w': round(adv_weight, 4),
+            'train_d_loss': round(train_d_loss, 6),
+            'train_g_loss': round(train_g_loss, 6),
+            'train_proxy': round(train_proxy, 6),
+            'val_proxy': round(val_metrics['proxy'], 6),
+            'val_token_ce': round(val_metrics['token_ce'], 6),
+            'val_length_loss': round(val_metrics['length_loss'], 6),
+            'val_nonempty': round(val_metrics['nonempty'], 6),
+            'val_len_mae': round(val_metrics['len_mae'], 6),
+            'val_eos_exact': round(val_metrics['eos_exact'], 6),
+            'val_ngram2': round(val_metrics['ngram2'], 6),
+            'val_ngram3': round(val_metrics['ngram3'], 6),
+            'val_aa_kl': round(val_metrics['aa_kl'], 6),
+            'val_repeat_ratio': round(val_metrics['repeat_ratio'], 6),
         }
-        csv_rows.append(row)
-        write_metrics_csv(csv_rows)
+        write_metrics_row(METRICS_CSV_PATH, fieldnames, row)
 
         print(
-            f"Epoch {epoch + 1}/{EPOCHS} | "
-            f"phase: {row['phase']} | "
-            f"adv_w: {adv_weight:.3f} | "
-            f"temp: {sampling_temperature:.3f} | "
-            f"D_loss: {train_loss_d:.4f} | "
-            f"G_loss: {train_loss_g:.4f} | "
-            f"val_proxy: {val_proxy:.4f} | "
-            f"ema_val_proxy: {ema_val_proxy:.4f} | "
-            f"best_ema_val_proxy: {best_val_proxy:.4f} | "
-            f"val_valid: {val_metrics['valid']:.2f} | "
-            f"val_nonempty: {val_metrics['nonempty']:.2f} | "
-            f"val_len_mae: {val_metrics['len_mae']:.2f} | "
-            f"val_ng2: {val_metrics['ngram2']:.3f} | "
-            f"val_ng3: {val_metrics['ngram3']:.3f} | "
-            f"val_aa_kl: {val_metrics['aa_kl']:.4f}"
+            f"Epoch {epoch+1}/{EPOCHS} | phase: {row['phase']} | tau: {tau:.3f} | adv_w: {adv_weight:.3f} | "
+            f"train_D: {train_d_loss:.4f} | train_G: {train_g_loss:.4f} | train_proxy: {train_proxy:.4f} | "
+            f"val_proxy: {val_metrics['proxy']:.4f} | val_nonempty: {val_metrics['nonempty']:.2f} | "
+            f"val_len_mae: {val_metrics['len_mae']:.2f} | val_eos_exact: {val_metrics['eos_exact']:.2f} | "
+            f"val_ng2: {val_metrics['ngram2']:.3f} | val_ng3: {val_metrics['ngram3']:.3f} | "
+            f"val_aa_kl: {val_metrics['aa_kl']:.4f} | val_repeat: {val_metrics['repeat_ratio']:.3f} | "
+            f"ema_val_proxy: {ema_val_metrics['proxy']:.4f} | best_val_proxy: {best_val_proxy:.4f}"
         )
 
-    print(f"Training finished. Latest generator saved to: {MODEL_SAVE_PATH}")
-    print(f"Latest EMA generator saved to: {EMA_MODEL_SAVE_PATH}")
-    print(f"Best EMA proxy checkpoint saved to: {BEST_EMA_PROXY_MODEL_SAVE_PATH}")
-    print(f"Metrics CSV saved to: {METRICS_CSV_PATH}")
+    print(f'Training finished. Best checkpoint: {GENERATOR_BEST_PATH}')
+    print(f'EMA best checkpoint: {EMA_BEST_PATH}')
+    print(f'Metrics CSV: {METRICS_CSV_PATH}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

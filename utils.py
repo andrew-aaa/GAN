@@ -1,9 +1,11 @@
-"""Вспомогательные функции для кодирования и декодирования белковых последовательностей."""
-
 from __future__ import annotations
 
+import csv
+import random
+from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -19,64 +21,54 @@ from config import (
     EOS_TOKEN,
 )
 
-
 aa_to_idx = {aa: i for i, aa in enumerate(VOCAB)}
 idx_to_aa = {i: aa for aa, i in aa_to_idx.items()}
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def clean_sequence(seq: str) -> str:
-    """Оставляет только допустимые аминокислоты и удаляет служебные токены."""
     seq = seq.strip().upper()
-    return "".join(
-        aa for aa in seq
-        if aa in aa_to_idx and aa not in (PAD_TOKEN, BOS_TOKEN, EOS_TOKEN)
-    )
+    return ''.join(aa for aa in seq if aa in aa_to_idx and aa not in (PAD_TOKEN, BOS_TOKEN, EOS_TOKEN))
 
 
-def encode_sequence(seq: str, max_aa_len: int = MAX_AA_LEN, max_len: int = MAX_LEN):
-    """
-    Преобразует строку в пару для teacher forcing.
-
-    Возвращает:
-      decoder_input: [BOS, aa1, aa2, ..., aaN, PAD, ...]
-      target:        [aa1, aa2, ..., aaN, EOS, PAD, ...]
-      aa_length:     число аминокислот без EOS/PAD
-    """
+def encode_sequence(seq: str, max_aa_len: int = MAX_AA_LEN):
     seq = clean_sequence(seq)[:max_aa_len]
     aa_length = len(seq)
-
     aa_ids = [aa_to_idx[aa] for aa in seq]
+
     decoder_input = [BOS_IDX] + aa_ids
     target = aa_ids + [EOS_IDX]
 
-    if len(decoder_input) < max_len:
-        decoder_input += [PAD_IDX] * (max_len - len(decoder_input))
-    else:
-        decoder_input = decoder_input[:max_len]
+    decoder_input = decoder_input[:MAX_LEN]
+    target = target[:MAX_LEN]
 
-    if len(target) < max_len:
-        target += [PAD_IDX] * (max_len - len(target))
-    else:
-        target = target[:max_len]
-        target[-1] = EOS_IDX
-        aa_length = min(aa_length, max_len - 1)
+    if len(decoder_input) < MAX_LEN:
+        decoder_input += [PAD_IDX] * (MAX_LEN - len(decoder_input))
+    if len(target) < MAX_LEN:
+        target += [PAD_IDX] * (MAX_LEN - len(target))
 
+    aa_length = min(aa_length, MAX_AA_LEN)
     return decoder_input, target, aa_length
 
 
 def decode_sequence(indices: Iterable[int]) -> str:
-    """Собирает аминокислотную строку до EOS/PAD."""
-    chars = []
-    for i in indices:
-        i = int(i)
-        if i in (PAD_IDX, BOS_IDX, EOS_IDX):
-            if i == EOS_IDX or i == PAD_IDX:
+    out = []
+    for idx in indices:
+        idx = int(idx)
+        if idx in (PAD_IDX, BOS_IDX, EOS_IDX):
+            if idx == EOS_IDX:
                 break
             continue
-        aa = idx_to_aa.get(i)
-        if aa is not None:
-            chars.append(aa)
-    return "".join(chars)
+        aa = idx_to_aa.get(idx)
+        if aa is not None and aa not in (PAD_TOKEN, BOS_TOKEN, EOS_TOKEN):
+            out.append(aa)
+    return ''.join(out)
 
 
 def to_one_hot(seq: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -87,27 +79,18 @@ def gumbel_softmax(logits: torch.Tensor, temperature: float = 1.0, hard: bool = 
     return F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=-1)
 
 
-def build_length_masks(target_lengths: torch.Tensor, seq_len: int):
-    """
-    target_lengths: [B] — число аминокислот до EOS.
-    EOS должен стоять в позиции == target_length.
-    """
-    device = target_lengths.device
-    positions = torch.arange(seq_len, device=device).unsqueeze(0)
-    target_lengths = target_lengths.unsqueeze(1)
-
-    before_eos = positions < target_lengths
-    eos_pos = positions == target_lengths
-    after_eos = positions > target_lengths
-    return before_eos, eos_pos, after_eos
+def build_valid_mask_from_lengths(lengths: torch.Tensor, seq_len: int) -> torch.Tensor:
+    positions = torch.arange(seq_len, device=lengths.device).unsqueeze(0)
+    # valid target positions are amino acids [0..len-1] plus EOS at position len
+    return positions <= lengths.unsqueeze(1)
 
 
-def infer_lengths_from_tokens(token_ids: torch.Tensor, eos_idx: int = EOS_IDX, pad_idx: int = PAD_IDX) -> torch.Tensor:
-    """Оценивает длину как число токенов до первого EOS/PAD."""
-    lengths = []
-    for row in token_ids:
-        pos = 0
-        while pos < row.numel() and int(row[pos]) not in (eos_idx, pad_idx):
-            pos += 1
-        lengths.append(pos)
-    return torch.tensor(lengths, device=token_ids.device, dtype=torch.long)
+def write_metrics_row(csv_path: str, fieldnames: list[str], row: dict) -> None:
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open('a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
