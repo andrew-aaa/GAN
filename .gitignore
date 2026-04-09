@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Logs / metrics
+logs/
+*.log
+metrics.csv
+
+# Generated archives / artifacts
+*.zip
+*.tar
+*.gz
+
+# Data files
+data/toxin_embeddings.pt
+data/toxins_paired.fasta
+data/antitoxins_paired.fasta
+
+# Temporary outputs
+tmp/
+temp/
+outputs/
+results/
+
+# Local configs
+.env
+*.local
