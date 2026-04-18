@@ -55,7 +55,11 @@ MISMATCH_WEIGHT = 0.5
 
 # Основные supervised-компоненты
 TOKEN_CE_WEIGHT = 1.0
-LENGTH_LOSS_WEIGHT = 0.75
+LENGTH_LOSS_WEIGHT = 1.0
+# Дополнительная регрессия по ожидаемой длине length-head.
+# CE учит выбирать класс длины, SmoothL1 напрямую снижает MAE длины.
+LENGTH_REG_WEIGHT = 0.10
+LENGTH_REG_BETA = 10.0
 LABEL_SMOOTHING = 0.0
 
 # Явный контроль длины/EOS/PAD.

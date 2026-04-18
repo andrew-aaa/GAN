@@ -112,6 +112,35 @@ def length_control_losses(logits: torch.Tensor, target_lengths: torch.Tensor) ->
     }
 
 
+
+def expected_lengths_from_logits(length_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Дифференцируемая оценка длины: математическое ожидание по softmax(length_logits).
+    Это позволяет напрямую штрафовать ошибку длины через SmoothL1, а не только
+    классифицировать длину как один из дискретных классов.
+    """
+    probs = F.softmax(length_logits, dim=-1)
+    length_values = torch.arange(length_logits.size(-1), device=length_logits.device).float()
+    return (probs * length_values.unsqueeze(0)).sum(dim=-1)
+
+
+def length_supervised_loss(length_logits: torch.Tensor, target_lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Общий loss для length-head:
+    - CE: учит выбирать правильный класс длины;
+    - SmoothL1 по expected length: напрямую уменьшает MAE длины.
+    """
+    length_ce = F.cross_entropy(length_logits, target_lengths)
+    expected_lengths = expected_lengths_from_logits(length_logits)
+    length_reg = F.smooth_l1_loss(
+        expected_lengths,
+        target_lengths.float(),
+        beta=cfg("LENGTH_REG_BETA", 10.0),
+    )
+    total = length_ce + cfg("LENGTH_REG_WEIGHT", 0.10) * length_reg
+    return total, length_ce, length_reg, expected_lengths
+
+
 def build_length_constrained_onehot(
     logits: torch.Tensor,
     pred_lengths: torch.Tensor,
@@ -185,8 +214,10 @@ def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, 
     metrics = []
     constrained_metrics = []
     ce_vals, len_vals = [], []
+    len_ce_vals, len_reg_vals = [], []
     eos_vals, pad_vals, aa_before_vals, bos_vals = [], [], [], []
     pred_len_mae_vals, pred_len_exact_vals = [], []
+    expected_len_mae_vals = []
 
     for toxin_emb, decoder_input, target, aa_lengths in loader:
         toxin_emb = toxin_emb.to(DEVICE).float()
@@ -200,13 +231,16 @@ def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, 
         fake_onehot = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
 
         length_logits = generator.get_length_logits(toxin_emb)
+        length_total, length_ce, length_reg, expected_lengths = length_supervised_loss(length_logits, aa_lengths)
         pred_lengths = length_logits.argmax(dim=-1).clamp(min=0, max=logits.size(1) - 1)
         constrained_onehot = build_length_constrained_onehot(logits, pred_lengths, tau=tau, hard=True)
 
         length_terms = length_control_losses(logits, aa_lengths)
 
         ce_vals.append(float(token_ce_loss(logits, target).item()))
-        len_vals.append(float(F.cross_entropy(length_logits, aa_lengths).item()))
+        len_vals.append(float(length_total.item()))
+        len_ce_vals.append(float(length_ce.item()))
+        len_reg_vals.append(float(length_reg.item()))
         eos_vals.append(float(length_terms["eos_loss"].item()))
         pad_vals.append(float(length_terms["pad_after_loss"].item()))
         aa_before_vals.append(float(length_terms["aa_before_loss"].item()))
@@ -214,6 +248,7 @@ def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, 
 
         pred_len_mae_vals.append(float((pred_lengths - aa_lengths).abs().float().mean().item()))
         pred_len_exact_vals.append(float((pred_lengths == aa_lengths).float().mean().item()))
+        expected_len_mae_vals.append(float((expected_lengths - aa_lengths.float()).abs().mean().item()))
 
         metrics.append(collect_metrics(fake_onehot, target, aa_lengths))
         constrained_metrics.append(collect_metrics(constrained_onehot, target, aa_lengths))
@@ -223,6 +258,8 @@ def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, 
 
     out["token_ce"] = float(sum(ce_vals) / max(1, len(ce_vals)))
     out["length_loss"] = float(sum(len_vals) / max(1, len(len_vals)))
+    out["length_ce_loss"] = float(sum(len_ce_vals) / max(1, len(len_ce_vals)))
+    out["length_reg_loss"] = float(sum(len_reg_vals) / max(1, len(len_reg_vals)))
     out["eos_loss"] = float(sum(eos_vals) / max(1, len(eos_vals)))
     out["pad_after_loss"] = float(sum(pad_vals) / max(1, len(pad_vals)))
     out["aa_before_loss"] = float(sum(aa_before_vals) / max(1, len(aa_before_vals)))
@@ -237,6 +274,7 @@ def evaluate(generator: Generator, loader: DataLoader, epoch: int) -> dict[str, 
     )
 
     out["pred_len_mae"] = float(sum(pred_len_mae_vals) / max(1, len(pred_len_mae_vals)))
+    out["expected_len_mae"] = float(sum(expected_len_mae_vals) / max(1, len(expected_len_mae_vals)))
     out["pred_len_exact"] = float(sum(pred_len_exact_vals) / max(1, len(pred_len_exact_vals)))
 
     out["constrained_nonempty"] = constrained_out.get("nonempty", 0.0)
@@ -296,10 +334,10 @@ def main():
     fieldnames = [
         "epoch", "phase", "tau", "adv_w",
         "train_d_loss", "train_g_loss", "train_proxy",
-        "train_token_ce", "train_length_loss", "train_eos_loss", "train_pad_after_loss", "train_aa_before_loss",
-        "val_proxy", "val_token_ce", "val_length_loss", "val_eos_loss", "val_pad_after_loss", "val_aa_before_loss",
+        "train_token_ce", "train_length_loss", "train_length_ce_loss", "train_length_reg_loss", "train_eos_loss", "train_pad_after_loss", "train_aa_before_loss",
+        "val_proxy", "val_token_ce", "val_length_loss", "val_length_ce_loss", "val_length_reg_loss", "val_eos_loss", "val_pad_after_loss", "val_aa_before_loss",
         "val_nonempty", "val_len_mae", "val_eos_exact", "val_ngram2", "val_ngram3", "val_aa_kl", "val_repeat_ratio",
-        "val_pred_len_mae", "val_pred_len_exact",
+        "val_pred_len_mae", "val_expected_len_mae", "val_pred_len_exact",
         "val_constrained_nonempty", "val_constrained_len_mae", "val_constrained_eos_exact",
         "val_constrained_ngram2", "val_constrained_ngram3", "val_constrained_aa_kl", "val_constrained_repeat_ratio",
         "val_inference_proxy",
@@ -314,7 +352,8 @@ def main():
 
         batch_metrics = []
         d_losses, g_losses, proxies = [], [], []
-        token_losses, length_losses, eos_losses, pad_losses, aa_before_losses = [], [], [], [], []
+        token_losses, length_losses, length_ce_losses, length_reg_losses = [], [], [], []
+        eos_losses, pad_losses, aa_before_losses = [], [], []
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}", leave=False)
         for batch_idx, (toxin_emb, decoder_input, target, aa_lengths) in enumerate(progress):
@@ -360,7 +399,8 @@ def main():
                 fake_onehot_g = F.gumbel_softmax(logits_g, tau=tau, hard=True, dim=-1)
 
                 token_loss = token_ce_loss(logits_g, target)
-                length_loss = F.cross_entropy(generator.get_length_logits(toxin_emb), aa_lengths)
+                length_logits_g = generator.get_length_logits(toxin_emb)
+                length_loss, length_ce_loss, length_reg_loss, _ = length_supervised_loss(length_logits_g, aa_lengths)
                 length_terms = length_control_losses(logits_g, aa_lengths)
 
                 adv_loss = torch.tensor(0.0, device=DEVICE)
@@ -397,6 +437,8 @@ def main():
                 proxies.append(proxy)
                 token_losses.append(float(token_loss.item()))
                 length_losses.append(float(length_loss.item()))
+                length_ce_losses.append(float(length_ce_loss.item()))
+                length_reg_losses.append(float(length_reg_loss.item()))
                 eos_losses.append(float(length_terms["eos_loss"].item()))
                 pad_losses.append(float(length_terms["pad_after_loss"].item()))
                 aa_before_losses.append(float(length_terms["aa_before_loss"].item()))
@@ -418,6 +460,8 @@ def main():
         train_proxy = float(sum(proxies) / max(1, len(proxies))) if proxies else math.inf
         train_token_ce = float(sum(token_losses) / max(1, len(token_losses)))
         train_length_loss = float(sum(length_losses) / max(1, len(length_losses)))
+        train_length_ce_loss = float(sum(length_ce_losses) / max(1, len(length_ce_losses)))
+        train_length_reg_loss = float(sum(length_reg_losses) / max(1, len(length_reg_losses)))
         train_eos_loss = float(sum(eos_losses) / max(1, len(eos_losses)))
         train_pad_after_loss = float(sum(pad_losses) / max(1, len(pad_losses)))
         train_aa_before_loss = float(sum(aa_before_losses) / max(1, len(aa_before_losses)))
@@ -448,12 +492,16 @@ def main():
             "train_proxy": round(train_proxy, 6),
             "train_token_ce": round(train_token_ce, 6),
             "train_length_loss": round(train_length_loss, 6),
+            "train_length_ce_loss": round(train_length_ce_loss, 6),
+            "train_length_reg_loss": round(train_length_reg_loss, 6),
             "train_eos_loss": round(train_eos_loss, 6),
             "train_pad_after_loss": round(train_pad_after_loss, 6),
             "train_aa_before_loss": round(train_aa_before_loss, 6),
             "val_proxy": round(val_metrics["proxy"], 6),
             "val_token_ce": round(val_metrics["token_ce"], 6),
             "val_length_loss": round(val_metrics["length_loss"], 6),
+            "val_length_ce_loss": round(val_metrics["length_ce_loss"], 6),
+            "val_length_reg_loss": round(val_metrics["length_reg_loss"], 6),
             "val_eos_loss": round(val_metrics["eos_loss"], 6),
             "val_pad_after_loss": round(val_metrics["pad_after_loss"], 6),
             "val_aa_before_loss": round(val_metrics["aa_before_loss"], 6),
@@ -465,6 +513,7 @@ def main():
             "val_aa_kl": round(val_metrics["aa_kl"], 6),
             "val_repeat_ratio": round(val_metrics["repeat_ratio"], 6),
             "val_pred_len_mae": round(val_metrics["pred_len_mae"], 6),
+            "val_expected_len_mae": round(val_metrics["expected_len_mae"], 6),
             "val_pred_len_exact": round(val_metrics["pred_len_exact"], 6),
             "val_constrained_nonempty": round(val_metrics["constrained_nonempty"], 6),
             "val_constrained_len_mae": round(val_metrics["constrained_len_mae"], 6),
@@ -485,7 +534,7 @@ def main():
             f"val_proxy: {val_metrics['proxy']:.4f} | val_infer_proxy: {val_metrics['inference_proxy']:.4f} | "
             f"val_nonempty: {val_metrics['nonempty']:.2f} | val_len_mae: {val_metrics['len_mae']:.2f} | "
             f"val_eos_exact: {val_metrics['eos_exact']:.2f} | pred_len_mae: {val_metrics['pred_len_mae']:.2f} | "
-            f"constr_len_mae: {val_metrics['constrained_len_mae']:.2f} | constr_eos: {val_metrics['constrained_eos_exact']:.2f} | "
+            f"exp_len_mae: {val_metrics['expected_len_mae']:.2f} | constr_len_mae: {val_metrics['constrained_len_mae']:.2f} | constr_eos: {val_metrics['constrained_eos_exact']:.2f} | "
             f"val_ng2: {val_metrics['ngram2']:.3f} | val_ng3: {val_metrics['ngram3']:.3f} | "
             f"val_aa_kl: {val_metrics['aa_kl']:.4f} | val_repeat: {val_metrics['repeat_ratio']:.3f} | "
             f"ema_val_proxy: {ema_val_metrics['proxy']:.4f} | ema_infer_proxy: {ema_val_metrics['inference_proxy']:.4f} | "

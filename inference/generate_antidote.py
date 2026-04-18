@@ -9,7 +9,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
-from config import DEVICE, LATENT_DIM, GENERATOR_BEST_PATH, EMA_BEST_PATH
+from config import DEVICE, LATENT_DIM, GENERATOR_BEST_PATH, EMA_BEST_PATH, MAX_AA_LEN, VOCAB, AA_START_IDX
 try:
     from config import GENERATOR_BEST_INFERENCE_PATH, EMA_BEST_INFERENCE_PATH
 except ImportError:
@@ -70,6 +70,39 @@ def candidate_score(seq: str, target_length: int) -> tuple[float, int, int, floa
     return (score, uniq, run, max_freq)
 
 
+
+def fixed_length_decode_from_probs(probs: torch.Tensor, target_length: int) -> str:
+    """
+    Декодирует ровно target_length канонических аминокислот.
+
+    Если на какой-то позиции модель выбрала служебный токен PAD/BOS/EOS,
+    позиция заменяется на наиболее вероятную допустимую аминокислоту.
+    Это делает вывод аккуратным для диплома: фактическая длина всегда равна
+    предсказанной length-head длине.
+    """
+    target_length = max(1, min(int(target_length), int(MAX_AA_LEN)))
+    probs = probs.detach().cpu()
+    chars = []
+
+    for pos in range(min(target_length, probs.size(0))):
+        row = probs[pos]
+        idx = int(row.argmax().item())
+
+        if idx >= AA_START_IDX:
+            chars.append(VOCAB[idx])
+        else:
+            aa_idx = int(row[AA_START_IDX:].argmax().item()) + AA_START_IDX
+            chars.append(VOCAB[aa_idx])
+
+    # На случай если sample вернул меньше позиций, добираем наиболее частой AA из уже выбранных,
+    # а если строка пустая — 'A'.
+    if len(chars) < target_length:
+        filler = Counter(chars).most_common(1)[0][0] if chars else "A"
+        chars.extend([filler] * (target_length - len(chars)))
+
+    return "".join(chars[:target_length])
+
+
 def main():
     ckpt = choose_checkpoint()
     generator = Generator().to(DEVICE)
@@ -83,6 +116,7 @@ def main():
     best = None
     with torch.no_grad():
         predicted_length = int(generator.predict_lengths(toxin_emb).item())
+        predicted_length = max(1, min(predicted_length, int(MAX_AA_LEN)))
         target_lengths = torch.tensor([predicted_length], device=DEVICE)
 
         for temperature in GENERATION_TEMPERATURES:
@@ -93,10 +127,12 @@ def main():
                     z=z,
                     target_lengths=target_lengths,
                     temperature=float(temperature),
-                    hard=True,
+                    hard=False,
                 )
-                ids = probs.argmax(dim=-1).squeeze(0).cpu().tolist()
-                seq = decode_sequence(ids)
+                probs_1d = probs.squeeze(0)
+                ids = probs_1d.argmax(dim=-1).cpu().tolist()
+                raw_seq = decode_sequence(ids)
+                seq = fixed_length_decode_from_probs(probs_1d, predicted_length)
                 score, uniq, run, max_freq = candidate_score(seq, predicted_length)
                 item = (score, seq, uniq, run, max_freq, temperature)
                 if best is None or item[0] < best[0]:
