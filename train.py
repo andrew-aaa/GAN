@@ -25,6 +25,27 @@ from training.metrics import (
     repeat_ratio,
 )
 
+def force_math_attention_for_wgan_gp() -> None:
+    """
+    WGAN-GP использует create_graph=True и затем делает backward через
+    дискриминатор. На CUDA PyTorch может выбрать Flash / memory-efficient SDPA
+    внутри TransformerEncoderLayer, а эти ядра не поддерживают нужную вторую
+    производную. Поэтому для обучения с WGAN-GP принудительно включаем math SDPA.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+
+        print("[attention] Flash/mem-efficient SDPA disabled; math SDPA enabled for WGAN-GP.")
+    except Exception as exc:
+        print(f"[attention] Could not force math SDPA: {exc}")
 
 def get_adv_weight(epoch_idx: int) -> float:
     """Линейно включает adversarial-компонент после pretrain-фазы."""
@@ -169,6 +190,7 @@ def make_fake_onehot_teacher(
 
 def main() -> None:
     set_seed(SEED)
+    force_math_attention_for_wgan_gp()
 
     if torch.cuda.is_available() and str(DEVICE).startswith("cuda"):
         torch.backends.cuda.matmul.allow_tf32 = True
