@@ -38,7 +38,8 @@ PROJECTION_DIM = 128
 
 # ===== training =====
 SEED = 42
-BATCH_SIZE = 16
+# Для Colab T4 лучше 2-4. Если памяти хватает, можно поднять до 8/16.
+BATCH_SIZE = 4
 EPOCHS = 40
 GENERATOR_PRETRAIN_EPOCHS = 8
 N_CRITIC = 3
@@ -51,14 +52,32 @@ GRAD_CLIP_NORM = 1.0
 LAMBDA_GP = 10.0
 ADV_WEIGHT_MAX = 0.10
 MISMATCH_WEIGHT = 0.5
+
+# Основные supervised-компоненты
 TOKEN_CE_WEIGHT = 1.0
-LENGTH_LOSS_WEIGHT = 0.25
+LENGTH_LOSS_WEIGHT = 0.75
 LABEL_SMOOTHING = 0.0
+
+# Явный контроль длины/EOS/PAD. Эти веса добавлены после анализа графиков:
+# nonempty высокий, но eos_exact был около нуля, а len_mae был большим.
+EOS_LOSS_WEIGHT = 0.75
+PAD_AFTER_EOS_WEIGHT = 0.35
+AA_BEFORE_EOS_WEIGHT = 0.25
+BOS_FORBIDDEN_WEIGHT = 0.05
+
+# Весовые коэффициенты только для выбора best-checkpoint по val_proxy.
+PROXY_LENGTH_WEIGHT = 0.50
+PROXY_EOS_WEIGHT = 0.50
+PROXY_PAD_WEIGHT = 0.20
+PROXY_AA_KL_WEIGHT = 0.20
+
 EMA_DECAY = 0.999
 TAU_START = 1.0
 TAU_END = 0.5
-NUM_WORKERS = 2
-PIN_MEMORY = True
+NUM_WORKERS = 0
+PIN_MEMORY = False
+RESET_METRICS_CSV = True
+EMPTY_CACHE_EACH_EPOCH = False
 
 # ===== paths =====
 TOXIN_FASTA_PATH = str(DATA_DIR / 'toxins_paired.fasta')
