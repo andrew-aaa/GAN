@@ -27,10 +27,12 @@ from utils import decode_sequence
 
 
 def choose_checkpoint() -> str:
+    # Сначала берём checkpoint, выбранный по метрикам constrained/inference-режима,
+    # затем fallback на обычный best_val.
     candidates = [
         EMA_BEST_INFERENCE_PATH,
-        EMA_BEST_PATH,
         GENERATOR_BEST_INFERENCE_PATH,
+        EMA_BEST_PATH,
         GENERATOR_BEST_PATH,
     ]
     for path in candidates:
@@ -74,6 +76,7 @@ def main():
     generator.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     generator.eval()
 
+    # Здесь можно заменить токсин на интересующую последовательность.
     toxin_seq = "VLKLNLKKSFQKDFDKLLLNGFDDSVLNEVILTLRKKEPLDPQFQDHALKGKWKPFRECHIKPDVLLVYLVKDDELILLRLGSHSELF"
     toxin_emb = get_esm_embedding(toxin_seq).unsqueeze(0).to(DEVICE).float()
 

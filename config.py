@@ -58,18 +58,23 @@ TOKEN_CE_WEIGHT = 1.0
 LENGTH_LOSS_WEIGHT = 0.75
 LABEL_SMOOTHING = 0.0
 
-# Явный контроль длины/EOS/PAD. Эти веса добавлены после анализа графиков:
-# nonempty высокий, но eos_exact был около нуля, а len_mae был большим.
+# Явный контроль длины/EOS/PAD.
 EOS_LOSS_WEIGHT = 0.75
 PAD_AFTER_EOS_WEIGHT = 0.35
 AA_BEFORE_EOS_WEIGHT = 0.25
 BOS_FORBIDDEN_WEIGHT = 0.05
 
-# Весовые коэффициенты только для выбора best-checkpoint по val_proxy.
+# Весовые коэффициенты только для выбора best-checkpoint по обычному val_proxy.
 PROXY_LENGTH_WEIGHT = 0.50
 PROXY_EOS_WEIGHT = 0.50
 PROXY_PAD_WEIGHT = 0.20
 PROXY_AA_KL_WEIGHT = 0.20
+
+# Весовые коэффициенты для выбора best-checkpoint под реальный режим генерации.
+INFERENCE_LENGTH_MAE_WEIGHT = 0.03
+INFERENCE_EOS_ERROR_WEIGHT = 1.00
+INFERENCE_AA_KL_WEIGHT = 0.20
+INFERENCE_REPEAT_WEIGHT = 0.20
 
 EMA_DECAY = 0.999
 TAU_START = 1.0
@@ -88,15 +93,17 @@ TOXIN_EMBEDDINGS_PATH = str(DATA_DIR / 'toxin_embeddings.pt')
 
 GENERATOR_LAST_PATH = str(CHECKPOINT_DIR / 'generator_last.pt')
 GENERATOR_BEST_PATH = str(CHECKPOINT_DIR / 'generator_best_val.pt')
+GENERATOR_BEST_INFERENCE_PATH = str(CHECKPOINT_DIR / 'generator_best_inference.pt')
 EMA_LAST_PATH = str(CHECKPOINT_DIR / 'generator_ema_last.pt')
 EMA_BEST_PATH = str(CHECKPOINT_DIR / 'generator_ema_best_val.pt')
+EMA_BEST_INFERENCE_PATH = str(CHECKPOINT_DIR / 'generator_ema_best_inference.pt')
 METRICS_CSV_PATH = str(LOG_DIR / 'metrics.csv')
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ===== validation / inference =====
-# Валидация теперь дополнительно оценивает реальный режим генерации:
-# длина берётся из length-head, а EOS/PAD жёстко маскируются по этой длине.
+# Дополнительная оценка режима, который реально используется при генерации:
+# длина берётся из length-head, EOS/PAD жёстко фиксируются по предсказанной длине.
 CONSTRAINED_EVAL = True
 TOP_K = 8
 NUM_GENERATION_ATTEMPTS = 16
