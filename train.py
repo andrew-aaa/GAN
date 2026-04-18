@@ -52,7 +52,6 @@ def collect_metrics(
     real_target: torch.Tensor,
     target_lengths: torch.Tensor,
 ) -> Dict[str, float]:
-    """"""
     fake_ids = fake_onehot.argmax(dim=-1).detach().cpu()
     real_ids = real_target.detach().cpu()
     target_lengths = target_lengths.detach().cpu()
