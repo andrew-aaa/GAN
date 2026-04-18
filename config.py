@@ -93,3 +93,11 @@ EMA_BEST_PATH = str(CHECKPOINT_DIR / 'generator_ema_best_val.pt')
 METRICS_CSV_PATH = str(LOG_DIR / 'metrics.csv')
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ===== validation / inference =====
+# Валидация теперь дополнительно оценивает реальный режим генерации:
+# длина берётся из length-head, а EOS/PAD жёстко маскируются по этой длине.
+CONSTRAINED_EVAL = True
+TOP_K = 8
+NUM_GENERATION_ATTEMPTS = 16
+GENERATION_TEMPERATURES = (1.2, 1.0, 0.9, 0.8)
