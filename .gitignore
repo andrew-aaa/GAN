@@ -50,6 +50,11 @@ temp/
 outputs/
 results/
 
+# Validation file
+validation/*.fasta
+validation/*.csv
+validation/*.json
+
 # Local configs
 .env
 *.local
