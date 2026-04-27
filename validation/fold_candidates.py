@@ -1,4 +1,14 @@
 # Сохраните это в /content/GAN/validation/fold_candidates.py
+import sys
+from types import ModuleType
+
+try:
+    import torch._six
+except ImportError:
+    torch_six = ModuleType("torch._six")
+    torch_six.inf = float("inf")
+    sys.modules["torch._six"] = torch_six
+
 import pandas as pd
 import torch
 import esm
