@@ -147,9 +147,14 @@ def get_toxin_embedding(
                 if isinstance(key, str) and key.split()[0] == toxin_id and torch.is_tensor(value):
                     return value.detach().float()
 
-            # Формат: {"ids": [...], "embeddings": tensor/list}
+            
             ids = cache.get("ids") or cache.get("toxin_ids") or cache.get("names")
-            embs = cache.get("embeddings") or cache.get("toxin_embeddings") or cache.get("embs")
+            embs = cache.get("embeddings")
+            if embs is None:
+                embs = cache.get("toxin_embeddings")
+            if embs is None:
+                embs = cache.get("embs")
+
             if ids is not None and embs is not None and toxin_id in ids:
                 idx = list(ids).index(toxin_id)
                 return torch.as_tensor(embs[idx]).detach().float()
