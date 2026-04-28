@@ -1,18 +1,10 @@
-# === PyTorch (CUDA 12.1) ===
---index-url https://download.pytorch.org/whl/cu121
-torch==2.4.0
-torchvision==0.19.0
-torchaudio==2.4.0
-
-# === Core Project ===
+# === Core & Utils ===
 fair-esm[esmfold]==2.0.0
 biopython==1.84
 pandas==2.2.2
 tqdm==4.66.4
 numpy==1.26.4
 modelcif==1.2
-
-# === ESMFold / OpenFold Dependencies ===
 omegaconf==2.3.0
 einops==0.7.0
 pytorch-lightning==2.3.0
