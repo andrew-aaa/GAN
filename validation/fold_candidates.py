@@ -1,7 +1,12 @@
-# Сохраните это в /content/GAN/validation/fold_candidates.py
 import sys
 from types import ModuleType
+import numpy as np
 
+# ==== FIX numpy ====
+if not hasattr(np, "BUFSIZE"):
+    np.BUFSIZE = 8192
+
+# ==== FIX torch._six ====
 try:
     import torch._six
 except ImportError:
@@ -9,11 +14,35 @@ except ImportError:
     torch_six.inf = float("inf")
     sys.modules["torch._six"] = torch_six
 
-import pandas as pd
+
+# ==== 🔥 КЛЮЧЕВОЙ ФИКС esmfold ====
+
+# создаем фейковый модуль ДО импорта esm
+fake_trunk = ModuleType("esm.esmfold.v1.trunk")
+
+class StructureModuleConfig:
+    def __init__(self, *args, **kwargs):
+        pass
+
+class IPAConfig:
+    def __init__(self, *args, **kwargs):
+        pass
+
+fake_trunk.StructureModuleConfig = StructureModuleConfig
+fake_trunk.IPAConfig = IPAConfig
+
+# подсовываем в систему
+sys.modules["esm.esmfold.v1.trunk"] = fake_trunk
+
+
+# ==== теперь можно импортировать esm ====
 import torch
 import esm
-import os
+import pandas as pd
 from pathlib import Path
+import os
+
+# 5. Остальной код (функция main и т.д.)
 
 def main():
     # Настройки
@@ -31,8 +60,7 @@ def main():
     model = esm.pretrained.esmfold_v1()
     model = model.eval().cuda()
     
-    # Опционально для экономии памяти на длинных белках
-    # model.set_chunk_size(128)
+    model.set_chunk_size(64)
 
     print(f"Начинаю предсказание для {len(top_candidates)} структур...")
     
