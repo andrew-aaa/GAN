@@ -120,6 +120,43 @@ def install_core_deps():
     cmd = [sys.executable, "-m", "pip", "install", "-q"] + packages
     return run_cmd(cmd, "Установка core-зависимостей")
 
+def install_openfold():
+    """Устанавливает openfold из совместимого коммита."""
+    # Проверяем, установлен ли уже
+    try:
+        import openfold
+        print_ok("openfold уже импортируется")
+        return True
+    except ImportError:
+        pass
+    
+    # --no-deps чтобы не перетянуть несовместимые версии
+    cmd = [
+        sys.executable, "-m", "pip", "install", "-q",
+        f"openfold @ {OPENFOLD_URL}",
+        "--no-deps",
+    ]
+    # Устанавливаем переменные окружения для CUDA
+    env = os.environ.copy()
+    env["CUDA_HOME"] = "/usr/local/cuda"
+    env["PATH"] = f"/usr/local/cuda/bin:{env.get('PATH', '')}"
+    
+    print_step(f"Установка openfold (коммит {OPENFOLD_COMMIT[:8]}...)")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+            timeout=900  # 15 минут на компиляцию CUDA-ядер
+        )
+        print_ok("Успешно")
+        return True
+    except subprocess.CalledProcessError as e:
+        print_err(f"Ошибка компиляции openfold")
+        print_err(f"Попробуйте вручную: pip install '{OPENFOLD_URL}' --no-deps")
+        return False
 
 def install_fair_esm():
     """Устанавливает fair-esm (без [esmfold], так как openfold уже стоит)."""
@@ -211,6 +248,7 @@ def main():
         ("Системные зависимости", install_system_deps),
         ("PyTorch", install_pytorch),
         ("Core-зависимости", install_core_deps),
+        ("OpenFold", install_openfold),
         ("fair-esm", install_fair_esm),
         ("Патчи совместимости", apply_patches),
     ]
